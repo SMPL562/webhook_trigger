@@ -2,119 +2,201 @@ import csv
 import json
 import requests
 import time
+import argparse
+import sys
 import os
-import pickle
 import glob
-from datetime import datetime
+import logging
 from concurrent.futures import ThreadPoolExecutor, as_completed
-from threading import Lock
+from threading import Lock, Semaphore
+from tqdm import tqdm
+from datetime import datetime
 
-class ProgressTracker:
-    def __init__(self, filename='progress.pkl'):
-        self.filename = filename
-        self.completed = set()
-        self.failed = []
+# Configure logging
+logging.basicConfig(
+    level=logging.INFO,
+    format='%(asctime)s - %(levelname)s - %(message)s',
+    handlers=[
+        logging.FileHandler('webhook_trigger.log'),
+        logging.StreamHandler(sys.stdout)
+    ]
+)
+logger = logging.getLogger(__name__)
+
+class RateLimiter:
+    def __init__(self, rate_limit, max_concurrent):
+        self.rate_limit = rate_limit  # Initial rate limit in seconds
         self.lock = Lock()
-        self.total_processed = 0
-        self.load_progress()
-    
-    def load_progress(self):
-        if os.path.exists(self.filename):
-            try:
-                with open(self.filename, 'rb') as f:
-                    data = pickle.load(f)
-                    self.completed = data.get('completed', set())
-                    self.failed = data.get('failed', [])
-                    self.total_processed = len(self.completed)
-                    print(f"✅ Resumed: {self.total_processed} already completed")
-            except:
-                print("⚠️ Could not load progress file, starting fresh")
-    
-    def save_progress(self):
-        with self.lock:
-            with open(self.filename, 'wb') as f:
-                pickle.dump({
-                    'completed': self.completed,
-                    'failed': self.failed,
-                    'timestamp': datetime.now().isoformat()
-                }, f)
-    
-    def mark_completed(self, url):
-        with self.lock:
-            self.completed.add(url)
-            self.total_processed += 1
-            
-            # Save every 500 completions
-            if self.total_processed % 500 == 0:
-                self.save_progress()
-                print(f"💾 Progress saved: {self.total_processed} completed")
-    
-    def mark_failed(self, url, error):
-        with self.lock:
-            self.failed.append({'url': url, 'error': str(error), 'time': datetime.now().isoformat()})
-    
-    def is_completed(self, url):
-        with self.lock:
-            return url in self.completed
-
-def process_webhook(row_data, progress):
-    url, method, payload, header = row_data
-    
-    # Skip if already processed
-    if progress.is_completed(url):
-        return {'status': 'skipped', 'url': url}
-    
-    try:
-        # Prepare headers
-        headers = {}
-        if header:
-            try:
-                headers = json.loads(header)
-            except:
-                headers = {}
+        self.last_request_time = 0
+        self.semaphore = Semaphore(max_concurrent)
         
-        # Add timeout and retry logic
-        for attempt in range(3):
+    def wait_if_needed(self):
+        """Ensures proper rate limiting between requests"""
+        with self.lock:
+            now = time.time()
+            time_since_last = now - self.last_request_time
+            if time_since_last < self.rate_limit:
+                time.sleep(self.rate_limit - time_since_last)
+            self.last_request_time = time.time()
+    
+    def adjust_rate(self, new_rate_limit):
+        with self.lock:
+            self.rate_limit = new_rate_limit
+            logger.info(f"Rate limit adjusted to {new_rate_limit:.2f} seconds")
+
+    def get_rate(self):
+        with self.lock:
+            return self.rate_limit
+
+def make_request(url, method, payload, header, retries, rate_limiter, pbar, results_tracker):
+    """
+    Makes an HTTP request with retry and rate limiting.
+    After printing the API response (success or error), it immediately updates the shared tqdm progress bar.
+    Returns 0 on success, 1 on failure.
+    """
+    # Acquire semaphore for concurrent request limiting
+    with rate_limiter.semaphore:
+        # Wait according to rate limit
+        rate_limiter.wait_if_needed()
+        
+        start_time = time.time()
+        
+        for attempt in range(retries):
             try:
-                if method.upper() == "POST" and payload:
-                    response = requests.post(
-                        url, 
-                        json=json.loads(payload) if payload else {},
-                        headers=headers,
-                        timeout=30
-                    )
+                # Determine HTTP method
+                if not method:
+                    method_to_use = "POST" if payload else "GET"
                 else:
-                    response = requests.get(url, headers=headers, timeout=30)
+                    method_to_use = method.upper()
                 
+                # Prepare headers
+                headers = None
+                if header:
+                    try:
+                        headers = json.loads(header)
+                        if not isinstance(headers, dict):
+                            logger.warning(f"Header for {url} is not a valid JSON object. Ignoring header.")
+                            headers = None
+                    except Exception as e:
+                        logger.error(f"Error parsing header JSON for {url}: {e}")
+                        headers = None
+
+                # Execute the request with timeout
+                request_timeout = 30
+                if method_to_use == "POST":
+                    if payload:
+                        try:
+                            data = json.loads(payload)
+                        except Exception as e:
+                            logger.error(f"Error parsing payload JSON for {url}: {e}")
+                            data = payload
+                        response = requests.post(url, json=data, headers=headers, timeout=request_timeout)
+                    else:
+                        response = requests.post(url, headers=headers, timeout=request_timeout)
+                elif method_to_use == "GET":
+                    response = requests.get(url, headers=headers, timeout=request_timeout)
+                else:
+                    if payload:
+                        try:
+                            data = json.loads(payload)
+                        except Exception as e:
+                            logger.error(f"Error parsing payload JSON for {url}: {e}")
+                            data = payload
+                        response = requests.request(method_to_use, url, json=data, headers=headers, timeout=request_timeout)
+                    else:
+                        response = requests.request(method_to_use, url, headers=headers, timeout=request_timeout)
+                
+                # Handle response
                 if response.status_code == 200:
-                    progress.mark_completed(url)
-                    return {'status': 'success', 'url': url}
-                elif attempt == 2:  # Last attempt
-                    error = f"Status code: {response.status_code}"
-                    progress.mark_failed(url, error)
-                    return {'status': 'failed', 'url': url, 'error': error}
+                    # Limit response output for large responses
+                    response_preview = response.text[:200] + "..." if len(response.text) > 200 else response.text
+                    logger.info(f"Success: {url}, Response: {response_preview}")
+                    
+                    # Track result
+                    results_tracker.add_result({
+                        'url': url,
+                        'method': method_to_use,
+                        'status': 'success',
+                        'status_code': response.status_code,
+                        'timestamp': datetime.now().isoformat(),
+                        'response_time': time.time() - start_time,
+                        'attempt': attempt + 1
+                    })
+                    
+                    pbar.update(1)
+                    return 0
+                else:
+                    logger.error(f"Error: {url}, Status Code: {response.status_code}")
                     
             except requests.exceptions.Timeout:
-                if attempt == 2:
-                    progress.mark_failed(url, "Timeout")
-                    return {'status': 'failed', 'url': url, 'error': 'Timeout'}
+                logger.error(f"Timeout error for {url} (attempt {attempt + 1}/{retries})")
             except Exception as e:
-                if attempt == 2:
-                    progress.mark_failed(url, str(e))
-                    return {'status': 'failed', 'url': url, 'error': str(e)}
+                logger.error(f"Error: {url}, Exception: {e} (attempt {attempt + 1}/{retries})")
             
-            # Wait before retry
-            if attempt < 2:
-                time.sleep(1)
-                
-    except Exception as e:
-        progress.mark_failed(url, str(e))
-        return {'status': 'failed', 'url': url, 'error': str(e)}
+            if attempt < retries - 1:
+                time.sleep(1)  # Wait before retrying
 
-def read_csv_files():
-    """Read all http_triggers CSV files"""
-    webhooks = []
+        # If all retries fail
+        results_tracker.add_result({
+            'url': url,
+            'method': method_to_use if 'method_to_use' in locals() else 'UNKNOWN',
+            'status': 'failed',
+            'status_code': response.status_code if 'response' in locals() else None,
+            'timestamp': datetime.now().isoformat(),
+            'response_time': time.time() - start_time,
+            'attempt': retries
+        })
+        
+        pbar.update(1)
+        return 1
+
+class ResultsTracker:
+    def __init__(self):
+        self.results = []
+        self.lock = Lock()
     
+    def add_result(self, result):
+        with self.lock:
+            self.results.append(result)
+    
+    def save_results(self, filename='webhook_results.json'):
+        with self.lock:
+            try:
+                with open(filename, 'w') as f:
+                    json.dump(self.results, f, indent=2)
+                logger.info(f"Results saved to {filename}")
+            except Exception as e:
+                logger.error(f"Error saving results: {e}")
+
+def read_csv_in_chunks(csv_file, chunk_size=1000):
+    """Read CSV file in chunks for memory efficiency"""
+    try:
+        with open(csv_file, 'r', encoding='utf-8', errors='replace') as file:
+            reader = csv.DictReader(file)
+            chunk = []
+            for row in reader:
+                if 'webhook_url' in row and row['webhook_url'].strip():
+                    webhook_data = (
+                        row['webhook_url'].strip(),
+                        row.get('method', '').strip() or None,
+                        row.get('payload', '').strip() or None,
+                        row.get('header', '').strip() or None
+                    )
+                    chunk.append(webhook_data)
+                    if len(chunk) >= chunk_size:
+                        yield chunk
+                        chunk = []
+            if chunk:
+                yield chunk
+    except FileNotFoundError:
+        logger.error(f"CSV file '{csv_file}' not found.")
+        raise
+    except Exception as e:
+        logger.error(f"Error reading CSV file: {e}")
+        raise
+
+def read_multiple_csv_files(chunk_size=1000):
+    """Read multiple CSV files for Railway deployment"""
     # Look for your specific CSV files
     csv_files = [
         'http_triggers.csv',
@@ -127,164 +209,154 @@ def read_csv_files():
     existing_files = [f for f in csv_files if os.path.exists(f)]
     
     if not existing_files:
-        print("❌ No CSV files found!")
-        return webhooks
+        logger.error("No CSV files found!")
+        return
     
-    print(f"📄 Found {len(existing_files)} CSV file(s)")
+    logger.info(f"Found {len(existing_files)} CSV file(s): {existing_files}")
     
     # Process each file
     for csv_file in existing_files:
-        print(f"📖 Reading {csv_file}...")
-        
-        # Try different encodings
-        for encoding in ['utf-8', 'latin-1', 'cp1252']:
-            try:
-                with open(csv_file, 'r', encoding=encoding, errors='ignore') as f:
-                    reader = csv.DictReader(f)
-                    file_count = 0
-                    
-                    for row in reader:
-                        url = row.get('webhook_url', '').strip()
-                        if url:
-                            webhooks.append((
-                                url,
-                                row.get('method', 'GET').strip() or 'GET',
-                                row.get('payload', '').strip(),
-                                row.get('header', '').strip()
-                            ))
-                            file_count += 1
-                    
-                    print(f"  ✅ Read {file_count} webhooks from {csv_file}")
-                    break
-            except Exception as e:
-                if encoding == 'cp1252':  # Last encoding attempt
-                    print(f"  ❌ Error reading {csv_file}: {e}")
-                continue
-    
-    return webhooks
-
-def main():
-    print("=" * 50)
-    print("🚀 LeadSquared Webhook Trigger")
-    print("=" * 50)
-    
-    # Configuration
-    MAX_WORKERS = int(os.environ.get('MAX_WORKERS', '10'))
-    BATCH_SIZE = int(os.environ.get('BATCH_SIZE', '5000'))
-    
-    # Initialize progress tracker
-    progress = ProgressTracker()
-    
-    # Read all webhooks from all CSV files
-    print("📖 Reading CSV files...")
-    all_webhooks = read_csv_files()
-    
-    if not all_webhooks:
-        print("❌ No webhooks found in CSV files!")
-        return
-    
-    # Filter out already completed
-    webhooks_to_process = [w for w in all_webhooks if not progress.is_completed(w[0])]
-    
-    print(f"\n📊 Statistics:")
-    print(f"  Total webhooks found: {len(all_webhooks):,}")
-    print(f"  Already completed: {len(progress.completed):,}")
-    print(f"  To be processed: {len(webhooks_to_process):,}")
-    print(f"  Failed (will retry): {len(progress.failed):,}")
-    
-    if not webhooks_to_process:
-        print("\n✅ All webhooks already processed!")
-        return
-    
-    print(f"\n⚙️  Configuration:")
-    print(f"  Workers: {MAX_WORKERS}")
-    print(f"  Batch size: {BATCH_SIZE}")
-    
-    # Process in batches
-    total_batches = (len(webhooks_to_process) + BATCH_SIZE - 1) // BATCH_SIZE
-    
-    print(f"\n🔄 Starting processing in {total_batches} batches...")
-    
-    start_time = time.time()
-    success_count = 0
-    failed_count = 0
-    
-    for batch_num in range(0, len(webhooks_to_process), BATCH_SIZE):
-        batch = webhooks_to_process[batch_num:batch_num + BATCH_SIZE]
-        current_batch = (batch_num // BATCH_SIZE) + 1
-        
-        print(f"\n📦 Processing batch {current_batch}/{total_batches} ({len(batch)} webhooks)")
-        
-        batch_start = time.time()
-        
-        with ThreadPoolExecutor(max_workers=MAX_WORKERS) as executor:
-    futures = [executor.submit(process_webhook, webhook, progress) for webhook in batch]
-    
-    batch_success = 0
-    batch_failed = 0
-    completed_in_batch = 0
-    
-    for future in as_completed(futures):
+        logger.info(f"Reading {csv_file}...")
         try:
-            result = future.result()
-            completed_in_batch += 1
-            
-            # Print progress every 100 completions
-            if completed_in_batch % 100 == 0:
-                print(f"  📊 Batch progress: {completed_in_batch}/{len(batch)}")
-            
-            if result['status'] == 'success':
-                batch_success += 1
-                success_count += 1
-            elif result['status'] == 'failed':
-                batch_failed += 1
-                failed_count += 1
+            yield from read_csv_in_chunks(csv_file, chunk_size)
         except Exception as e:
-            print(f"❌ Executor error: {e}")
-            failed_count += 1
-            
-        batch_time = time.time() - batch_start
-        rate = len(batch) / batch_time if batch_time > 0 else 0
+            logger.error(f"Error reading {csv_file}: {e}")
+            continue
+
+def trigger_webhooks_parallel(csv_file, base_rate_limit, starting_rate_limit, max_rate_limit, 
+                            window_size, error_threshold, max_workers):
+    try:
+        # Count total webhooks first
+        total_requests = 0
+        all_webhooks = []
         
-        print(f"  ✅ Success: {batch_success}")
-        print(f"  ❌ Failed: {batch_failed}")
-        print(f"  ⏱️  Time: {batch_time:.1f}s ({rate:.1f} webhooks/sec)")
+        # For Railway deployment with multiple files
+        if csv_file == "AUTO":
+            logger.info("Reading webhooks from multiple CSV files...")
+            for chunk in read_multiple_csv_files():
+                all_webhooks.extend(chunk)
+                total_requests += len(chunk)
+        else:
+            # Single file mode
+            logger.info(f"Reading webhooks from {csv_file}")
+            for chunk in read_csv_in_chunks(csv_file):
+                all_webhooks.extend(chunk)
+                total_requests += len(chunk)
         
-        # Save progress after each batch
-        progress.save_progress()
+        if not all_webhooks:
+            logger.warning("No valid webhook URLs found in CSV.")
+            return
+
+        logger.info(f"Found {total_requests} webhook entries in CSV.")
+
+        rate_limiter = RateLimiter(starting_rate_limit, max_workers)
+        results_tracker = ResultsTracker()
+        error_window = []
+
+        logger.info(f"Triggering {total_requests} webhooks with up to {max_workers} parallel threads...\n")
+
+        # Create a shared tqdm progress bar.
+        with ThreadPoolExecutor(max_workers=max_workers) as executor:
+            with tqdm(total=total_requests, desc="Progress", dynamic_ncols=True) as pbar:
+                future_to_url = {
+                    executor.submit(make_request, url, method, payload, header, 3, rate_limiter, pbar, results_tracker): url
+                    for url, method, payload, header in all_webhooks
+                }
+                
+                for future in as_completed(future_to_url):
+                    try:
+                        error = future.result()
+                        error_window.append(error)
+                        if len(error_window) > window_size:
+                            error_window.pop(0)
+                    except Exception as e:
+                        url = future_to_url[future]
+                        logger.error(f"Error processing {url}: {e}")
+
+                    # Adjust rate limit every window_size responses
+                    if pbar.n % window_size == 0 and pbar.n > 0 and error_window:
+                        error_rate = sum(error_window) / len(error_window)
+                        current_rate_limit = rate_limiter.get_rate()
+                        
+                        if error_rate > error_threshold:
+                            new_rate_limit = min(max_rate_limit, current_rate_limit * 1.2)
+                            rate_limiter.adjust_rate(new_rate_limit)
+                            logger.info(f"Increasing rate limit to {new_rate_limit:.2f} sec (error rate {error_rate:.2%}).")
+                        elif error_rate < error_threshold / 2:
+                            new_rate_limit = max(base_rate_limit, current_rate_limit / 1.2)
+                            rate_limiter.adjust_rate(new_rate_limit)
+                            logger.info(f"Decreasing rate limit to {new_rate_limit:.2f} sec (error rate {error_rate:.2%}).")
+
+        # Save results
+        results_tracker.save_results()
         
-        # Estimate remaining time
-        if batch_num > 0:
-            elapsed = time.time() - start_time
-            avg_rate = success_count / elapsed
-            remaining = len(webhooks_to_process) - (batch_num + len(batch))
-            eta = remaining / avg_rate if avg_rate > 0 else 0
-            print(f"  ⏳ ETA: {eta/60:.1f} minutes")
+        # Print summary
+        successful = sum(1 for r in results_tracker.results if r['status'] == 'success')
+        failed = sum(1 for r in results_tracker.results if r['status'] == 'failed')
+        logger.info(f"\nFinished processing all webhooks. Success: {successful}, Failed: {failed}")
         
-        # Small delay between batches
-        if current_batch < total_batches:
-            time.sleep(2)
-    
-    # Final save
-    progress.save_progress()
-    
-    # Final report
-    total_time = time.time() - start_time
-    print("\n" + "=" * 50)
-    print("📊 FINAL REPORT")
-    print("=" * 50)
-    print(f"✅ Total Successful: {len(progress.completed):,}")
-    print(f"❌ Total Failed: {len(progress.failed):,}")
-    print(f"⏱️  Total Time: {total_time/60:.1f} minutes")
-    print(f"📈 Average Rate: {len(progress.completed)/total_time:.1f} webhooks/sec")
-    
-    # Save detailed failed report
-    if progress.failed:
-        with open('failed_webhooks.json', 'w') as f:
-            json.dump(progress.failed, f, indent=2)
-        print(f"\n💾 Failed webhooks saved to: failed_webhooks.json")
-    
-    print("\n✅ Process completed!")
+        sys.stdout.flush()
+
+    except FileNotFoundError:
+        logger.error(f"Error: CSV file '{csv_file}' not found.")
+    except Exception as e:
+        logger.error(f"Unexpected error: {e}")
+
+def load_config():
+    """Load configuration from environment variables or use defaults"""
+    return {
+        'BASE_RATE_LIMIT': float(os.getenv('BASE_RATE_LIMIT', '3')),
+        'STARTING_RATE_LIMIT': float(os.getenv('STARTING_RATE_LIMIT', '3')),
+        'MAX_RATE_LIMIT': float(os.getenv('MAX_RATE_LIMIT', '5.0')),
+        'WINDOW_SIZE': int(os.getenv('WINDOW_SIZE', '20')),
+        'ERROR_THRESHOLD': float(os.getenv('ERROR_THRESHOLD', '0.3')),
+        'MAX_WORKERS': int(os.getenv('MAX_WORKERS', '3'))
+    }
 
 if __name__ == "__main__":
-    main()
+    # For Railway deployment, we'll use environment variables instead of command line args
+    if os.getenv('RAILWAY_ENVIRONMENT'):
+        # Railway deployment mode
+        config = load_config()
+        logger.info(f"Configuration: {config}")
+        
+        trigger_webhooks_parallel(
+            "AUTO",  # Special flag to read multiple CSV files
+            config['BASE_RATE_LIMIT'],
+            config['STARTING_RATE_LIMIT'],
+            config['MAX_RATE_LIMIT'],
+            config['WINDOW_SIZE'],
+            config['ERROR_THRESHOLD'],
+            config['MAX_WORKERS']
+        )
+    else:
+        # Local mode with command line arguments
+        parser = argparse.ArgumentParser(description="Trigger webhooks with dynamic rate adjustment.")
+        parser.add_argument("csv_file", help="Path to the CSV file containing webhook details.")
+        parser.add_argument("--config", help="Path to JSON config file (optional)")
+        args = parser.parse_args()
+
+        # Load configuration
+        config = load_config()
+        
+        # Override with config file if provided
+        if args.config:
+            try:
+                with open(args.config, 'r') as f:
+                    file_config = json.load(f)
+                    config.update(file_config)
+                    logger.info(f"Loaded configuration from {args.config}")
+            except Exception as e:
+                logger.warning(f"Could not load config file: {e}. Using defaults.")
+        
+        logger.info(f"Configuration: {config}")
+        
+        trigger_webhooks_parallel(
+            args.csv_file,
+            config['BASE_RATE_LIMIT'],
+            config['STARTING_RATE_LIMIT'],
+            config['MAX_RATE_LIMIT'],
+            config['WINDOW_SIZE'],
+            config['ERROR_THRESHOLD'],
+            config['MAX_WORKERS']
+        )
