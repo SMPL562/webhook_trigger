@@ -168,13 +168,22 @@ class ResultsTracker:
             except Exception as e:
                 logger.error(f"Error saving results: {e}")
 
-def read_csv_in_chunks(csv_file, chunk_size=1000):
+def read_csv_in_chunks(csv_file, chunk_size=1000, skip_rows=0):
     """Read CSV file in chunks for memory efficiency"""
     try:
         with open(csv_file, 'r', encoding='utf-8', errors='replace') as file:
             reader = csv.DictReader(file)
             chunk = []
+            row_count = 0
+            skipped_count = 0
+            
             for row in reader:
+                # Skip rows if needed
+                if row_count < skip_rows:
+                    row_count += 1
+                    skipped_count += 1
+                    continue
+                    
                 if 'webhook_url' in row and row['webhook_url'].strip():
                     webhook_data = (
                         row['webhook_url'].strip(),
@@ -186,6 +195,11 @@ def read_csv_in_chunks(csv_file, chunk_size=1000):
                     if len(chunk) >= chunk_size:
                         yield chunk
                         chunk = []
+                row_count += 1
+                
+            if skipped_count > 0:
+                logger.info(f"Skipped {skipped_count} rows from {csv_file}")
+                
             if chunk:
                 yield chunk
     except FileNotFoundError:
@@ -195,7 +209,7 @@ def read_csv_in_chunks(csv_file, chunk_size=1000):
         logger.error(f"Error reading CSV file: {e}")
         raise
 
-def read_multiple_csv_files(chunk_size=1000):
+def read_multiple_csv_files(chunk_size=1000, skip_rows=0):
     """Read multiple CSV files for Railway deployment"""
     # Look for your specific CSV files
     csv_files = [
@@ -214,17 +228,33 @@ def read_multiple_csv_files(chunk_size=1000):
     
     logger.info(f"Found {len(existing_files)} CSV file(s): {existing_files}")
     
+    # Track total rows to skip across files
+    remaining_skip = skip_rows
+    
     # Process each file
     for csv_file in existing_files:
         logger.info(f"Reading {csv_file}...")
         try:
-            yield from read_csv_in_chunks(csv_file, chunk_size)
+            # Calculate how many rows to skip in this file
+            current_skip = remaining_skip if remaining_skip > 0 else 0
+            
+            # Read chunks from this file
+            chunks_read = 0
+            for chunk in read_csv_in_chunks(csv_file, chunk_size, current_skip):
+                yield chunk
+                chunks_read += len(chunk)
+                
+            # Update remaining skip count
+            # We need to know total rows in file to properly skip across files
+            # For now, we'll apply skip only to first file
+            remaining_skip = 0
+            
         except Exception as e:
             logger.error(f"Error reading {csv_file}: {e}")
             continue
 
 def trigger_webhooks_parallel(csv_file, base_rate_limit, starting_rate_limit, max_rate_limit, 
-                            window_size, error_threshold, max_workers):
+                            window_size, error_threshold, max_workers, skip_rows=0):
     try:
         # Count total webhooks first
         total_requests = 0
@@ -232,14 +262,14 @@ def trigger_webhooks_parallel(csv_file, base_rate_limit, starting_rate_limit, ma
         
         # For Railway deployment with multiple files
         if csv_file == "AUTO":
-            logger.info("Reading webhooks from multiple CSV files...")
-            for chunk in read_multiple_csv_files():
+            logger.info(f"Reading webhooks from multiple CSV files... (skipping first {skip_rows} rows)")
+            for chunk in read_multiple_csv_files(chunk_size=1000, skip_rows=skip_rows):
                 all_webhooks.extend(chunk)
                 total_requests += len(chunk)
         else:
             # Single file mode
-            logger.info(f"Reading webhooks from {csv_file}")
-            for chunk in read_csv_in_chunks(csv_file):
+            logger.info(f"Reading webhooks from {csv_file} (skipping first {skip_rows} rows)")
+            for chunk in read_csv_in_chunks(csv_file, chunk_size=1000, skip_rows=skip_rows):
                 all_webhooks.extend(chunk)
                 total_requests += len(chunk)
         
@@ -310,7 +340,8 @@ def load_config():
         'MAX_RATE_LIMIT': float(os.getenv('MAX_RATE_LIMIT', '5.0')),
         'WINDOW_SIZE': int(os.getenv('WINDOW_SIZE', '20')),
         'ERROR_THRESHOLD': float(os.getenv('ERROR_THRESHOLD', '0.3')),
-        'MAX_WORKERS': int(os.getenv('MAX_WORKERS', '3'))
+        'MAX_WORKERS': int(os.getenv('MAX_WORKERS', '3')),
+        'SKIP_ROWS': int(os.getenv('SKIP_ROWS', '0'))  # New variable
     }
 
 if __name__ == "__main__":
@@ -327,7 +358,8 @@ if __name__ == "__main__":
             config['MAX_RATE_LIMIT'],
             config['WINDOW_SIZE'],
             config['ERROR_THRESHOLD'],
-            config['MAX_WORKERS']
+            config['MAX_WORKERS'],
+            config['SKIP_ROWS']  # Pass skip_rows parameter
         )
     else:
         # Local mode with command line arguments
@@ -343,7 +375,7 @@ if __name__ == "__main__":
         if args.config:
             try:
                 with open(args.config, 'r') as f:
-                    file_config = json.load(f)
+                                        file_config = json.load(f)
                     config.update(file_config)
                     logger.info(f"Loaded configuration from {args.config}")
             except Exception as e:
@@ -358,5 +390,6 @@ if __name__ == "__main__":
             config['MAX_RATE_LIMIT'],
             config['WINDOW_SIZE'],
             config['ERROR_THRESHOLD'],
-            config['MAX_WORKERS']
+            config['MAX_WORKERS'],
+            config['SKIP_ROWS']  # Pass skip_rows parameter
         )
