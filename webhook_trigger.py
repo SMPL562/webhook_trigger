@@ -375,7 +375,7 @@ if __name__ == "__main__":
         if args.config:
             try:
                 with open(args.config, 'r') as f:
-                                        file_config = json.load(f)
+                    file_config = json.load(f)
                     config.update(file_config)
                     logger.info(f"Loaded configuration from {args.config}")
             except Exception as e:
