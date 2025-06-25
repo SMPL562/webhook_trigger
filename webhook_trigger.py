@@ -218,23 +218,30 @@ def main():
         batch_start = time.time()
         
         with ThreadPoolExecutor(max_workers=MAX_WORKERS) as executor:
-            futures = [executor.submit(process_webhook, webhook, progress) for webhook in batch]
+    futures = [executor.submit(process_webhook, webhook, progress) for webhook in batch]
+    
+    batch_success = 0
+    batch_failed = 0
+    completed_in_batch = 0
+    
+    for future in as_completed(futures):
+        try:
+            result = future.result()
+            completed_in_batch += 1
             
-            batch_success = 0
-            batch_failed = 0
+            # Print progress every 100 completions
+            if completed_in_batch % 100 == 0:
+                print(f"  📊 Batch progress: {completed_in_batch}/{len(batch)}")
             
-            for future in as_completed(futures):
-                try:
-                    result = future.result()
-                    if result['status'] == 'success':
-                        batch_success += 1
-                        success_count += 1
-                    elif result['status'] == 'failed':
-                        batch_failed += 1
-                        failed_count += 1
-                except Exception as e:
-                    print(f"❌ Executor error: {e}")
-                    failed_count += 1
+            if result['status'] == 'success':
+                batch_success += 1
+                success_count += 1
+            elif result['status'] == 'failed':
+                batch_failed += 1
+                failed_count += 1
+        except Exception as e:
+            print(f"❌ Executor error: {e}")
+            failed_count += 1
             
         batch_time = time.time() - batch_start
         rate = len(batch) / batch_time if batch_time > 0 else 0
