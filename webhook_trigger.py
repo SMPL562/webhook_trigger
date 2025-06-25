@@ -4,6 +4,7 @@ import requests
 import time
 import os
 import pickle
+import glob
 from datetime import datetime
 from concurrent.futures import ThreadPoolExecutor, as_completed
 from threading import Lock
@@ -110,62 +111,80 @@ def process_webhook(row_data, progress):
         progress.mark_failed(url, str(e))
         return {'status': 'failed', 'url': url, 'error': str(e)}
 
-def process_csv_file(filename):
-    """Read CSV and return webhook data"""
+def read_csv_files():
+    """Read all CSV files (handles split files)"""
     webhooks = []
     
-    # Try different encodings
-    for encoding in ['utf-8', 'latin-1', 'cp1252']:
-        try:
-            with open(filename, 'r', encoding=encoding, errors='ignore') as f:
-                reader = csv.DictReader(f)
-                for row in reader:
-                    url = row.get('webhook_url', '').strip()
-                    if url:
-                        webhooks.append((
-                            url,
-                            row.get('method', 'GET').strip() or 'GET',
-                            row.get('payload', '').strip(),
-                            row.get('header', '').strip()
-                        ))
-                print(f"✅ Successfully read CSV with {encoding} encoding")
-                break
-        except Exception as e:
-            continue
+    # Look for webhook CSV files
+    csv_patterns = ['webhooks*.csv', 'webhook*.csv', '*.csv']
+    csv_files = []
+    
+    for pattern in csv_patterns:
+        csv_files.extend(glob.glob(pattern))
+    
+    # Remove duplicates and sort
+    csv_files = sorted(list(set(csv_files)))
+    
+    if not csv_files:
+        print("❌ No CSV files found!")
+        return webhooks
+    
+    print(f"📄 Found {len(csv_files)} CSV file(s): {csv_files}")
+    
+    # Process each file
+    for csv_file in csv_files:
+        print(f"📖 Reading {csv_file}...")
+        
+        # Try different encodings
+        for encoding in ['utf-8', 'latin-1', 'cp1252']:
+            try:
+                with open(csv_file, 'r', encoding=encoding, errors='ignore') as f:
+                    reader = csv.DictReader(f)
+                    file_count = 0
+                    
+                    for row in reader:
+                        url = row.get('webhook_url', '').strip()
+                        if url:
+                            webhooks.append((
+                                url,
+                                row.get('method', 'GET').strip() or 'GET',
+                                row.get('payload', '').strip(),
+                                row.get('header', '').strip()
+                            ))
+                            file_count += 1
+                    
+                    print(f"  ✅ Read {file_count} webhooks from {csv_file}")
+                    break
+            except Exception as e:
+                continue
     
     return webhooks
 
 def main():
     print("=" * 50)
-    print("🚀 LeadSquared Webhook Trigger")
+    print("🚀 LeadSquared Webhook Trigger (Multi-File)")
     print("=" * 50)
     
     # Configuration
-    CSV_FILE = os.environ.get('CSV_FILE', 'webhooks.csv')
     MAX_WORKERS = int(os.environ.get('MAX_WORKERS', '10'))
     BATCH_SIZE = int(os.environ.get('BATCH_SIZE', '5000'))
-    
-    # Check if CSV exists
-    if not os.path.exists(CSV_FILE):
-        print(f"❌ Error: {CSV_FILE} not found!")
-        return
-    
-    # Get file size
-    file_size_mb = os.path.getsize(CSV_FILE) / (1024 * 1024)
-    print(f"📄 CSV File: {CSV_FILE} ({file_size_mb:.1f} MB)")
     
     # Initialize progress tracker
     progress = ProgressTracker()
     
-    # Read all webhooks
-    print("📖 Reading CSV file...")
-    all_webhooks = process_csv_file(CSV_FILE)
+    # Read all webhooks from all CSV files
+    print("📖 Reading CSV files...")
+    all_webhooks = read_csv_files()
+    
+    if not all_webhooks:
+        print("❌ No webhooks found in CSV files!")
+        return
     
     # Filter out already completed
     webhooks_to_process = [w for w in all_webhooks if not progress.is_completed(w[0])]
     
     print(f"\n📊 Statistics:")
-    print(f"  Total webhooks in CSV: {len(all_webhooks):,}")
+    print(f"  Total webhooks found: {len(all_webhooks):,}")
     print(f"  Already completed: {len(progress.completed):,}")
     print(f"  To be processed: {len(webhooks_to_process):,}")
     print(f"  Failed (will retry): {len(progress.failed):,}")
@@ -232,7 +251,7 @@ def main():
             eta = remaining / avg_rate if avg_rate > 0 else 0
             print(f"  ⏳ ETA: {eta/60:.1f} minutes")
         
-        # Small delay between batches to avoid overwhelming the server
+        # Small delay between batches
         if current_batch < total_batches:
             time.sleep(2)
     
