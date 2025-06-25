@@ -112,27 +112,28 @@ def process_webhook(row_data, progress):
         return {'status': 'failed', 'url': url, 'error': str(e)}
 
 def read_csv_files():
-    """Read all CSV files (handles split files)"""
+    """Read all http_triggers CSV files"""
     webhooks = []
     
-    # Look for webhook CSV files
-    csv_patterns = ['webhooks*.csv', 'webhook*.csv', '*.csv']
-    csv_files = []
+    # Look for your specific CSV files
+    csv_files = [
+        'http_triggers.csv',
+        'http_triggers 2.csv',
+        'http_triggers 3.csv', 
+        'http_triggers 4.csv'
+    ]
     
-    for pattern in csv_patterns:
-        csv_files.extend(glob.glob(pattern))
+    # Find existing files
+    existing_files = [f for f in csv_files if os.path.exists(f)]
     
-    # Remove duplicates and sort
-    csv_files = sorted(list(set(csv_files)))
-    
-    if not csv_files:
+    if not existing_files:
         print("❌ No CSV files found!")
         return webhooks
     
-    print(f"📄 Found {len(csv_files)} CSV file(s): {csv_files}")
+    print(f"📄 Found {len(existing_files)} CSV file(s)")
     
     # Process each file
-    for csv_file in csv_files:
+    for csv_file in existing_files:
         print(f"📖 Reading {csv_file}...")
         
         # Try different encodings
@@ -156,13 +157,15 @@ def read_csv_files():
                     print(f"  ✅ Read {file_count} webhooks from {csv_file}")
                     break
             except Exception as e:
+                if encoding == 'cp1252':  # Last encoding attempt
+                    print(f"  ❌ Error reading {csv_file}: {e}")
                 continue
     
     return webhooks
 
 def main():
     print("=" * 50)
-    print("🚀 LeadSquared Webhook Trigger (Multi-File)")
+    print("🚀 LeadSquared Webhook Trigger")
     print("=" * 50)
     
     # Configuration
