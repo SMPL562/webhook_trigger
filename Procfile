@@ -1,1 +1,1 @@
-web: python webhook_trigger.py && sleep infinity
+worker: python webhook_trigger.py
