@@ -341,16 +341,30 @@ def load_config():
         'WINDOW_SIZE': int(os.getenv('WINDOW_SIZE', '20')),
         'ERROR_THRESHOLD': float(os.getenv('ERROR_THRESHOLD', '0.3')),
         'MAX_WORKERS': int(os.getenv('MAX_WORKERS', '3')),
-        'SKIP_ROWS': int(os.getenv('SKIP_ROWS', '0'))  # New variable
+        'SKIP_ROWS': int(os.getenv('SKIP_ROWS', '0')),
+        'KEEP_ALIVE': os.getenv('KEEP_ALIVE', 'true').lower() == 'true'
     }
 
+def keep_alive():
+    """Keep the container running after webhook processing"""
+    logger.info("Webhook processing completed. Keeping container alive...")
+    logger.info("Container will run indefinitely. Check logs for webhook results.")
+    
+    try:
+        while True:
+            time.sleep(3600)  # Sleep for 1 hour intervals
+            logger.info("Container is still running...")
+    except KeyboardInterrupt:
+        logger.info("Received interrupt signal. Shutting down...")
+
 if __name__ == "__main__":
-    # For Railway deployment, we'll use environment variables instead of command line args
-    if os.getenv('RAILWAY_ENVIRONMENT'):
-        # Railway deployment mode
+    # For deployment mode (Coolify, Railway, etc.)
+    if os.getenv('DEPLOYMENT_MODE') or os.getenv('RAILWAY_ENVIRONMENT'):
+        # Deployment mode
         config = load_config()
         logger.info(f"Configuration: {config}")
         
+        # Process webhooks
         trigger_webhooks_parallel(
             "AUTO",  # Special flag to read multiple CSV files
             config['BASE_RATE_LIMIT'],
@@ -359,13 +373,21 @@ if __name__ == "__main__":
             config['WINDOW_SIZE'],
             config['ERROR_THRESHOLD'],
             config['MAX_WORKERS'],
-            config['SKIP_ROWS']  # Pass skip_rows parameter
+            config['SKIP_ROWS']
         )
+        
+        # Keep container alive if configured
+        if config['KEEP_ALIVE']:
+            keep_alive()
+        else:
+            logger.info("KEEP_ALIVE is disabled. Container will exit.")
+            
     else:
         # Local mode with command line arguments
         parser = argparse.ArgumentParser(description="Trigger webhooks with dynamic rate adjustment.")
         parser.add_argument("csv_file", help="Path to the CSV file containing webhook details.")
         parser.add_argument("--config", help="Path to JSON config file (optional)")
+        parser.add_argument("--keep-alive", action="store_true", help="Keep the process running after completion")
         args = parser.parse_args()
 
         # Load configuration
@@ -383,6 +405,7 @@ if __name__ == "__main__":
         
         logger.info(f"Configuration: {config}")
         
+        # Process webhooks
         trigger_webhooks_parallel(
             args.csv_file,
             config['BASE_RATE_LIMIT'],
@@ -391,5 +414,9 @@ if __name__ == "__main__":
             config['WINDOW_SIZE'],
             config['ERROR_THRESHOLD'],
             config['MAX_WORKERS'],
-            config['SKIP_ROWS']  # Pass skip_rows parameter
+            config['SKIP_ROWS']
         )
+        
+        # Keep alive if requested
+        if args.keep_alive or config['KEEP_ALIVE']:
+            keep_alive()
